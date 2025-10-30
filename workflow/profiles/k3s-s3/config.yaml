@@ -1,0 +1,41 @@
+# 1. 使用 K3s (Kubernetes) 执行器
+executor: kubernetes
+
+# 2. 设置默认的 S3 存储提供商
+default-storage-provider: s3
+default-storage-prefix: s3://whj/demo-wkf-StainedGlass/
+
+# 3. 将 S3/MinIO 凭证和服务器地址注入到 K3s Pods 中
+#    Snakemake 会从您当前的 shell 环境中读取这些变量
+envvars:
+  - AWS_ACCESS_KEY_ID
+  - AWS_SECRET_ACCESS_KEY
+  - AWS_ENDPOINT_URL
+
+# 4. 设置默认作业数
+jobs: 100
+latency-wait: 60
+
+# 5. 使用 Conda 环境
+use-conda: true
+conda-frontend: mamba
+
+# 6. 其他配置
+rerun-incomplete: true
+rerun-triggers: mtime
+show-failed-logs: true
+printshellcmds: true
+keep-going: false
+
+# 7. Kubernetes Pod 配置
+# 指定 Pod 使用的容器镜像（需要包含 conda/mamba 和基础工具）
+container-image: snakemake/snakemake:v9.11.2
+
+storage-s3-endpoint-url: http://10.3.217.200:20480
+storage-s3-max-requests-per-second: 100
+
+# 8. 移除与本地持久化存储相关的配置，因为集群没有 PVs
+# local-storage-prefix: .snakemake/storage # REMOVED
+# shared-fs-usage: # REMOVED
+#   - persistence
+

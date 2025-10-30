@@ -1,5 +1,5 @@
 sample: small
-fasta: .test/small.fasta
+fasta: inputs/small.fasta #inputs/small.fasta   # ← relative to bucket root
 window: 2000
 nbatch: 4
 alnthreads: 4

@@ -1,0 +1,5 @@
+default-storage-provider: fs
+executor: local
+jobs: 10
+config:
+  - fasta=.test/small.fasta

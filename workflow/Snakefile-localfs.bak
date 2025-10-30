@@ -1,13 +1,10 @@
 import math
 import os
 import sys
-from urllib.parse import urlparse
 
 from snakemake.utils import min_version
 
 min_version("8.0")
-
-# DO NOT import storage — it's built-in
 
 bold = "\033[1m"
 green = "\033[92m"
@@ -15,24 +12,25 @@ cyan = "\033[36m"
 end = "\033[0m"
 msg = f"""{green}{bold}Thanks for using StainedGlass and please remember to cite the tool!{end}{end}
     {cyan}Mitchell R Vollger, Peter Kerpedjiev, Adam M Phillippy, Evan E Eichler.
-         "StainedGlass: Interactive visualization of massive tandem repeat structures with identity heatmaps"
-         Bioinformatics, 2022; https://doi.org/10.1093/bioinformatics/btac018  {end}
+            "StainedGlass: Interactive visualization of massive tandem repeat structures with identity heatmaps"
+            Bioinformatics, 2022; https://doi.org/10.1093/bioinformatics/btac018{end}
 
 """
-
-onstart:
-    print(msg, file=sys.stderr)
+sys.stderr.write(msg)
 
 shell.prefix(f"set -eo pipefail; ")
 
+
+# container: "docker://continuumio/miniconda3"
+
+
 configfile: "config/config.yaml"
 
-# Use storage() directly — no import needed
-REMOTE_FASTA = storage(config["fasta"])
-REMOTE_FAI = storage(f"{config['fasta']}.fai")
+
+#
 # global options
 #
-N = config.pop("nbatch", 1)  # Use N directly
+N = config.pop("nbatch", 1)
 NUM_DUPS = config.pop("num_dups", 100)
 SM = config.pop("sample", "sample")
 W = config.pop("window", 2000)
@@ -49,42 +47,78 @@ assert W > SLIDE, f"window ({W}) must be larger than slide ({SLIDE})."
 # short vs long read mapping
 MAP_PARAMS = "-ax ava-ont "
 if W < 500:
+    # MAP_PARAMS = " -a --no-pairing -k21 --sr -A2 -B8 -O12,32 -E2,1 -r100 -g100 --heap-sort=yes -X -w 11  "
     MAP_PARAMS = " -a --no-pairing -X -k21 -w11 -A2 -B8 -O12,32 -E2,1 -r50 -p.5 -N20 -f1000,5000 -n2 -m20 -s40 -g200 -2K50m --heap-sort=yes "
 elif SLIDE > 0:
     S = config.pop("mm_s", 100)
     MAP_PARAMS = "-ax map-ont --secondary=no"
 
-# Since we assume single contig (small.fasta), hardcode REF_IDS
-REF_IDS = ["ref_0"]  # Adjust if multi-contig
+if TEMP_DIR != "temp":
+    if os.path.exists("temp"):
+        if os.path.realpath("temp") == os.path.realpath(TEMP_DIR):
+            print("The temp dir has already been linked.")
+        else:
+            sys.exit("temp/ already in use, please move it before running.")
+    else:
+        shell("ln -s {TEMP_DIR} temp")
 
-def get_all_bams(wildcards):
-    IDS_str = [str(i) for i in range(N)]
-    return expand(
-        "temp/{SM}.{W}.{F}.{ID}.{REF_ID}.bam",
-        SM=wildcards.SM,
-        W=wildcards.W,
-        F=wildcards.F,
-        ID=IDS_str,
-        REF_ID=REF_IDS,
-        allow_missing=True,
-    )
+#
+# required arguments
+#
+FASTA = os.path.abspath(config["fasta"])
+
+FAI = f"{FASTA}.fai"
+if not os.path.exists(FAI):
+    sys.exit(f"Input fasta must be indexed, try:\nsamtools faidx {FASTA}")
+
+#
+# setup split and gather
+#
+lengths = [math.ceil(int(line.split()[1]) / W) for line in open(FAI).readlines()]
+names = [line.split()[0] for line in open(FAI).readlines()]
+REF_IDS = [f"ref_{i}" for i in range(len(names))] if SLIDE > 0 else ["ref_0"]
+N_WINDOWS = int(sum(lengths))
+N = min(N, N_WINDOWS)
+IDS = list(range(N))
+sys.stderr.write(f"[INFO] The sequence will be split into {N} batches.\n")
+
 
 localrules:
     all,
+    bwa_index,
+    bwa_aln,
+    merge_aln,
+    identity,
+    pair_end_bed,
+    window_fa,
+    split_windows,
+    merge_list,
+    sort_aln,
+    identity,
+    pair_end_bed,
+    make_R_figures,
     make_figures,
+    cooler,
+    cooler_identity,
+    cooler_strand,
+    cooler_zoomify_i,
+    cooler_zoomify_s,
+
 
 wildcard_constraints:
-    ID=r"\d+",
-    REF_ID=r"ref_\d+",
+    ID="|".join(map(str, IDS)),
+    REF_ID="|".join(map(str, REF_IDS)),
     SM=SM,
     W=W,
     F=F,
+
 
 rule all:
     input:
         sort=expand("results/{SM}.{W}.{F}.sorted.bam", SM=SM, W=W, F=F),
         beds=expand("results/{SM}.{W}.{F}.bed.gz", SM=SM, W=W, F=F),
         fulls=expand("results/{SM}.{W}.{F}.full.tbl.gz", SM=SM, W=W, F=F),
+
 
 rule cooler:
     input:
@@ -93,13 +127,15 @@ rule cooler:
         cool_sm=expand("results/{SM}.{W}.{F}.strand.mcool", SM=SM, W=W, F=F),
         cool_im=expand("results/{SM}.{W}.{F}.identity.mcool", SM=SM, W=W, F=F),
 
+
 rule cooler_density:
     input:
         cool_d=expand("results/{SM}.{W}.{CW}.density.mcool", SM=SM, W=W, CW=CW),
 
+
 rule make_windows:
     input:
-        fai=REMOTE_FAI
+        fai=FAI,
     output:
         bed=temp("temp/{SM}.{W}.bed"),
     log:
@@ -116,11 +152,12 @@ rule make_windows:
         bedtools makewindows -g {input.fai} -w {wildcards.W} {params.slide} > {output.bed}
         """
 
+
 rule split_windows:
     input:
         bed=rules.make_windows.output.bed,
     output:
-        beds=temp(expand("temp/{{SM}}.{{W}}.{id}.bed", id=range(N)))
+        bed=temp(expand("temp/{SM}.{W}.{ID}.bed", ID=IDS, allow_missing=True)),
     threads: 1
     conda:
         "envs/env.yaml"
@@ -131,11 +168,14 @@ rule split_windows:
     params:
         script=workflow.source_path("scripts/batch_bed_files.py"),
     shell:
-        "python {params.script} {input.bed} --outputs {output}"
+        """
+        python {params.script} {input.bed} --outputs {output.bed}
+        """
+
 
 rule window_fa:
     input:
-        ref=REMOTE_FASTA,
+        ref=FASTA,
         bed=rules.make_windows.output.bed,
     output:
         fasta="results/{SM}.{W}.fasta",
@@ -152,9 +192,10 @@ rule window_fa:
             > {output.fasta}
         """
 
+
 rule split_fa:
     input:
-        ref=REMOTE_FASTA,
+        ref=FASTA,
     output:
         fasta=temp("temp/{SM}.{W}.{REF_ID}.split.fasta"),
     conda:
@@ -163,14 +204,14 @@ rule split_fa:
         "logs/split_fa.{SM}.{W}.{REF_ID}.log",
     threads: 1
     params:
-        name="*"  # Not used since we assume single contig; or remove this rule if unused
+        name=lambda wc: names[int(wc.REF_ID.strip("ref_"))],
     resources:
         mem=4,
     shell:
         """
-        # For single contig, just copy full FASTA
-        cp {input.ref} {output.fasta}
+        samtools faidx {input.ref} {params.name} > {output.fasta} 
         """
+
 
 rule aln_prep:
     input:
@@ -197,10 +238,11 @@ rule aln_prep:
         2> {log}
         """
 
+
 rule query_prep:
     input:
-        ref=REMOTE_FASTA,
-        bed="temp/{SM}.{W}.{ID}.bed"
+        ref=FASTA,
+        bed="temp/{SM}.{W}.{ID}.bed",
     output:
         query_fasta=temp("temp/{SM}.{W}.{ID}.query.fasta"),
     conda:
@@ -215,6 +257,7 @@ rule query_prep:
         bedtools getfasta -fi {input.ref} -bed {input.bed} \
             > {output.query_fasta}
         """
+
 
 rule aln:
     input:
@@ -245,9 +288,15 @@ rule aln:
         ) 2> {log}
         """
 
+
 rule merge_list:
     input:
-        bams=get_all_bams,
+        aln=expand(
+            "temp/{SM}.{W}.{F}.{ID}.{REF_ID}.bam",
+            ID=IDS,
+            REF_ID=REF_IDS,
+            allow_missing=True,
+        ),
     output:
         alns=temp("temp/{SM}.{W}.{F}.list"),
     threads: 1
@@ -256,12 +305,18 @@ rule merge_list:
     resources:
         mem=8,
     run:
-        open(output.alns, "w").write("\n".join(input.bams) + "\n")
+        open(output.alns, "w").write("\n".join(input.aln) + "\n")
+
 
 rule merge_aln:
     input:
         alns=rules.merge_list.output.alns,
-        bams_list=get_all_bams,
+        aln=expand(
+            "temp/{SM}.{W}.{F}.{ID}.{REF_ID}.bam",
+            REF_ID=REF_IDS,
+            ID=IDS,
+            allow_missing=True,
+        ),
     output:
         aln=temp("temp/{SM}.{W}.{F}.bam"),
     conda:
@@ -273,15 +328,16 @@ rule merge_aln:
         mem=4,
     shell:
         """
-        samtools merge -@ {threads} -b {input.alns} {output.aln}
+        #samtools cat -b {input.alns} -o {output.aln} 
+        samtools merge -@ {threads} -b {input.alns} {output.aln} 
         """
+
 
 rule sort_aln:
     input:
         aln=rules.merge_aln.output.aln,
     output:
         aln="results/{SM}.{W}.{F}.sorted.bam",
-        bai="results/{SM}.{W}.{F}.sorted.bam.csi"
     conda:
         "envs/env.yaml"
     log:
@@ -294,6 +350,7 @@ rule sort_aln:
         samtools sort -m {resources.mem}G -@ {threads} --write-index \
             -o {output.aln} {input.aln}
         """
+
 
 rule identity:
     input:
@@ -310,6 +367,7 @@ rule identity:
         "logs/identity.{SM}.{W}.{F}.log",
     resources:
         mem=8,
+    threads: 8
     shell:
         """
         python {params.script} --threads {threads} \
@@ -318,10 +376,11 @@ rule identity:
             | pigz -p {threads} > {output.tbl}
         """
 
+
 rule pair_end_bed:
     input:
         tbl=rules.identity.output.tbl,
-        fai=REMOTE_FAI
+        fai=FAI,
     output:
         bed="results/{SM}.{W}.{F}.bed.gz",
         full="results/{SM}.{W}.{F}.full.tbl.gz",
@@ -344,6 +403,10 @@ rule pair_end_bed:
             {input.tbl} {output.bed}
         """
 
+
+#
+# for figures ~ 3Mbp or less
+#
 rule make_R_figures:
     input:
         bed=rules.pair_end_bed.output.bed,
@@ -379,28 +442,19 @@ rule make_R_figures:
             --prefix {wildcards.SM}.{wildcards.W}.{wildcards.F}
         """
 
+
 rule make_figures:
     input:
-        expand(
-            "results/{SM}.{W}.{F}_figures/pdfs/{SM}.{W}.{F}.tri.TRUE__onecolorscale.FALSE__all.pdf",
-            SM=SM, W=W, F=F
-        ),
-        expand(
-            "results/{SM}.{W}.{F}_figures/pngs/{SM}.{W}.{F}.tri.{first}__onecolorscale.{second}__all.png",
-            SM=SM, W=W, F=F,
-            first=["TRUE", "FALSE"],
-            second=["TRUE", "FALSE"],
-            allow_missing=True
-        ),
-        expand(
-            "results/{SM}.{W}.{F}_figures/pngs/{SM}.{W}.{F}.facet.all.png",
-            SM=SM, W=W, F=F
-        )
+        expand(rules.make_R_figures.output, SM=SM, W=W, F=F),
 
+
+#
+# for large scale visualization
+#
 rule cooler_strand:
     input:
         bed=rules.pair_end_bed.output.bed,
-        fai=REMOTE_FAI
+        fai=FAI,
     output:
         cool="results/{SM}.{W}.{F}.strand.cool",
     conda:
@@ -415,19 +469,20 @@ rule cooler_strand:
         gunzip -c {input.bed} | tail -n +2 \
             | sed  's/+$/100/g' \
             | sed  's/-$/50/g' \
-             | cooler cload pairs \
-                 -c1 1 -p1 2 -c2 4 -p2 5 \
-                         --field count=8:agg=mean,dtype=float \
+              | cooler cload pairs \
+                -c1 1 -p1 2 -c2 4 -p2 5 \
+                        --field count=8:agg=mean,dtype=float \
                 --chunksize 50000000000 \
                 {input.fai}:{wildcards.W} \
                 --zero-based \
                 - {output.cool}
         """
 
+
 rule cooler_identity:
     input:
         bed=rules.pair_end_bed.output.bed,
-        fai=REMOTE_FAI
+        fai=FAI,
     output:
         cool="results/{SM}.{W}.{F}.identity.cool",
     conda:
@@ -440,14 +495,16 @@ rule cooler_identity:
     shell:
         """
         gunzip -c {input.bed} | tail -n +2 \
-             | cooler cload pairs \
-                 -c1 1 -p1 2 -c2 4 -p2 5 \
-                         --field count=7:agg=mean,dtype=float \
+              | cooler cload pairs \
+                -c1 1 -p1 2 -c2 4 -p2 5 \
+                        --field count=7:agg=mean,dtype=float \
                 --chunksize 50000000000 \
                 {input.fai}:{wildcards.W} \
                 --zero-based \
                 - {output.cool}
+
         """
+
 
 rule cooler_zoomify_i:
     input:
@@ -464,9 +521,10 @@ rule cooler_zoomify_i:
     shell:
         """
         cooler zoomify --field count:agg=mean,dtype=float {input.i} \
-                 -n {threads} \
-               -o {output.i}
+                -n {threads} \
+             -o {output.i}
         """
+
 
 rule cooler_zoomify_s:
     input:
@@ -483,15 +541,16 @@ rule cooler_zoomify_s:
     shell:
         """
         cooler zoomify --field count:agg=mean,dtype=float {input.s} \
-                 -n {threads} \
-               -o {output.s}
+                -n {threads} \
+             -o {output.s}
         """
+
 
 rule bwa_index:
     input:
-        fasta=REMOTE_FASTA
+        fasta=FASTA,
     output:
-        multiext("temp/ref_{SM}", ".amb", ".ann", ".bwt", ".pac", ".sa")
+        done=touch("temp/bwa_ref_{SM}"),
     conda:
         "envs/env.yaml"
     log:
@@ -499,12 +558,13 @@ rule bwa_index:
     threads: 1
     shell:
         """
-        bwa index -p {output[0].removesuffix('.amb')} {input.fasta}
+        bwa index -p temp/ref_{wildcards.SM} {input.fasta}
         """
+
 
 rule bwa_aln:
     input:
-        bwa_index_done=multiext("temp/ref_{SM}", ".amb", ".ann", ".bwt", ".pac", ".sa"),
+        bwa_index_done="temp/bwa_ref_{SM}",
         reads=rules.window_fa.output.fasta,
     output:
         sam="results/output_{SM}_{W}.sam.gz",
@@ -514,14 +574,14 @@ rule bwa_aln:
         "logs/bwa_aln_{SM}_{W}.log",
     params:
         num_dups=NUM_DUPS,
-        prefix=lambda wc, input: input.bwa_index_done[0].removesuffix('.amb')
     threads: ALN_T
     shell:
         """
-        bwa aln -t {threads} {params.prefix} {input.reads} \
-            | bwa samse -n {params.num_dups} {params.prefix} - {input.reads} \
+        bwa aln -t {threads} temp/ref_{wildcards.SM} {input.reads} \
+            | bwa samse -n {params.num_dups} temp/ref_{wildcards.SM} - {input.reads} \
             | gzip > {output.sam}
         """
+
 
 rule create_contacts:
     input:
@@ -541,10 +601,11 @@ rule create_contacts:
             | gzip > {output.contacts}
         """
 
+
 rule cooler_density_d:
     input:
         contacts=rules.create_contacts.output.contacts,
-        fai=REMOTE_FAI
+        fai=FAI,
     output:
         cool="results/{SM}.{W}.{CW}.density.cool",
     conda:
@@ -557,12 +618,13 @@ rule cooler_density_d:
     shell:
         """
         cooler cload pairs \
-                 -c1 1 -p1 2 -c2 4 -p2 5 \
+                -c1 1 -p1 2 -c2 4 -p2 5 \
                 --chunksize 50000000000 \
                 {input.fai}:{wildcards.CW} \
                 --zero-based \
                 {input.contacts} {output.cool}
         """
+
 
 rule cooler_zoomify_d:
     input:
@@ -579,6 +641,6 @@ rule cooler_zoomify_d:
     shell:
         """
         cooler zoomify {input.d} \
-                 -n {threads} \
-               -o {output.d}
+                -n {threads} \
+             -o {output.d}
         """
