@@ -312,7 +312,7 @@ rule identity:
         mem=8,
     shell:
         """
-        python {params.script} --threads {threads} \
+        python {params.script} --threads 1 \
             --matches  {params.S} --header \
             {input.aln} \
             | pigz -p {threads} > {output.tbl}
